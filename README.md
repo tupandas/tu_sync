@@ -1,238 +1,356 @@
-# Offline-first Cache
+# Offline-first Cache Sync
 
-Система для оффлайн работы с данными. Читаем локально, пишем локально + складываем операции в outbox, синхронизируемся с бэком когда надо.
+Dart/Flutter библиотека для offline-first работы с данными. Локальный кэш на Drift + синхронизация с сервером.
 
-## Что тут есть
+**Принцип:** читаем локально → пишем локально + в outbox → sync() отправляет и получает данные.
 
-- **synchronize_cache** — основная библиотека синхронизации: SyncEngine, Outbox, Cursors, Conflict Resolution
-- **synchronize_cache_rest** — REST транспорт для API
-- **example/** — рабочий пример использования
+## Содержание
 
-Принцип простой: читаем всегда локально, пишем локально + в очередь на отправку, sync() делает push (отправка) потом pull (загрузка).
+- [Offline-first Cache Sync](#offline-first-cache-sync)
+  - [Содержание](#содержание)
+  - [Быстрый старт](#быстрый-старт)
+    - [1. Установка](#1-установка)
+    - [2. Настройка базы данных](#2-настройка-базы-данных)
+    - [3. Настройка SyncEngine](#3-настройка-syncengine)
+    - [4. Модель данных](#4-модель-данных)
+  - [Работа с данными](#работа-с-данными)
+    - [Чтение](#чтение)
+    - [Создание](#создание)
+    - [Обновление](#обновление)
+    - [Удаление](#удаление)
+    - [Синхронизация](#синхронизация)
+  - [Разрешение конфликтов](#разрешение-конфликтов)
+    - [Стратегии](#стратегии)
+    - [autoPreserve](#autopreserve)
+    - [Ручное разрешение](#ручное-разрешение)
+    - [Кастомный merge](#кастомный-merge)
+    - [Стратегия для отдельных таблиц](#стратегия-для-отдельных-таблиц)
+  - [События и статистика](#события-и-статистика)
+  - [Требования к серверу](#требования-к-серверу)
+    - [Обязательные эндпоинты](#обязательные-эндпоинты)
+    - [Обязательные поля в моделях](#обязательные-поля-в-моделях)
+    - [Детекция конфликтов](#детекция-конфликтов)
+    - [Идемпотентность](#идемпотентность)
+    - [Force-update](#force-update)
+    - [Пагинация](#пагинация)
+    - [Примеры реализации](#примеры-реализации)
+    - [Чеклист для сервера](#чеклист-для-сервера)
 
-## Как начать
+---
 
-```bash
-cd cache_workspace
-dart pub get
+## Быстрый старт
+
+### 1. Установка
+
+```yaml
+dependencies:
+  synchronize_cache:
+    path: packages/synchronize_cache
+  synchronize_cache_rest:
+    path: packages/synchronize_cache_rest
+  drift: ^2.0.0
 ```
 
-Базовая настройка:
+### 2. Настройка базы данных
 
 ```dart
+import 'package:drift/drift.dart';
 import 'package:synchronize_cache/synchronize_cache.dart';
-import 'package:synchronize_cache_rest/synchronize_cache_rest.dart';
 
-// База данных должна реализовать SyncDatabaseMixin
-@DriftDatabase(tables: [MyEntities, SyncOutbox, SyncCursors])
-class AppDatabase extends _$AppDatabase with SyncDatabaseMixin {
-  // ...
+// Таблицы для синхронизации (копируем структуру, используем типы из пакета)
+@UseRowClass(SyncOutboxData)
+class SyncOutboxLocal extends Table {
+  TextColumn get opId => text()();
+  TextColumn get kind => text()();
+  TextColumn get entityId => text()();
+  TextColumn get op => text()();
+  TextColumn get payload => text().nullable()();
+  IntColumn get ts => integer()();
+  IntColumn get tryCount => integer().withDefault(const Constant(0))();
+  IntColumn get baseUpdatedAt => integer().nullable()();
+  TextColumn get changedFields => text().nullable()();
+
+  @override
+  Set<Column> get primaryKey => {opId};
+  @override
+  String get tableName => 'sync_outbox';
 }
 
-// Транспорт для API
+@UseRowClass(SyncCursorsData)
+class SyncCursorsLocal extends Table {
+  TextColumn get kind => text()();
+  IntColumn get ts => integer()();
+  TextColumn get lastId => text()();
+
+  @override
+  Set<Column> get primaryKey => {kind};
+  @override
+  String get tableName => 'sync_cursors';
+}
+
+// База данных
+@DriftDatabase(tables: [DailyFeelings, SyncOutboxLocal, SyncCursorsLocal])
+class AppDatabase extends _$AppDatabase with SyncDatabaseMixin {
+  AppDatabase(super.e);
+  @override
+  int get schemaVersion => 1;
+}
+```
+
+### 3. Настройка SyncEngine
+
+```dart
+import 'package:synchronize_cache_rest/synchronize_cache_rest.dart';
+
 final transport = RestTransport(
   base: Uri.parse('https://api.example.com'),
-  token: () async => 'Bearer токен_тут',
+  token: () async => 'Bearer ${await getToken()}',
 );
 
-// Движок синхронизации
 final engine = SyncEngine(
   db: db,
   transport: transport,
   tables: [
-    SyncableTable<MyEntity>(
-      kind: 'my_entity',
-      table: db.myEntities,
-      fromJson: MyEntity.fromJson,
+    SyncableTable<DailyFeeling>(
+      kind: 'daily_feeling',
+      table: db.dailyFeelings,
+      fromJson: DailyFeeling.fromJson,
       toJson: (e) => e.toJson(),
       toInsertable: (e) => e.toInsertable(),
     ),
   ],
 );
-
-// Синхронизируем
-await engine.sync();
 ```
 
-Работа с данными:
+### 4. Модель данных
 
 ```dart
-// Добавление в очередь на отправку
-await db.enqueue(UpsertOp(
-  opId: uuid.v4(),
-  kind: 'my_entity',
-  id: entity.id,
-  localTimestamp: DateTime.now().toUtc(),
-  payloadJson: entity.toJson(),
-));
+@UseRowClass(DailyFeeling, generateInsertable: true)
+class DailyFeelings extends Table {
+  TextColumn get id => text()();
+  IntColumn get mood => integer().nullable()();
+  IntColumn get energy => integer().nullable()();
+  TextColumn get notes => text().nullable()();
+  DateTimeColumn get date => dateTime()();
+  DateTimeColumn get updatedAt => dateTime()();  // обязательно!
+  
+  @override
+  Set<Column> get primaryKey => {id};
+}
 ```
 
-## Conflict Resolution
+---
 
-Система поддерживает несколько стратегий разрешения конфликтов. По умолчанию используется **autoPreserve** — автоматическое слияние без потери данных.
+## Работа с данными
+
+### Чтение
+
+Всегда читаем из локальной БД — мгновенно, работает офлайн:
+
+```dart
+// Все записи
+final feelings = await db.select(db.dailyFeelings).get();
+
+// С фильтром
+final today = await (db.select(db.dailyFeelings)
+  ..where((t) => t.date.equals(DateTime.now())))
+  .getSingleOrNull();
+
+// Реактивный stream для UI
+db.select(db.dailyFeelings).watch().listen((list) {
+  setState(() => _feelings = list);
+});
+```
+
+### Создание
+
+Сохраняем локально + добавляем в outbox:
+
+```dart
+Future<void> create(DailyFeeling feeling) async {
+  // 1. Сразу в локальную БД (UI обновится мгновенно)
+  await db.into(db.dailyFeelings).insert(feeling);
+  
+  // 2. В очередь на отправку
+await db.enqueue(UpsertOp(
+  opId: uuid.v4(),
+    kind: 'daily_feeling',
+    id: feeling.id,
+  localTimestamp: DateTime.now().toUtc(),
+    payloadJson: feeling.toJson(),
+  ));
+}
+```
+
+### Обновление
+
+При обновлении важно указать `baseUpdatedAt` и `changedFields` для корректного merge:
+
+```dart
+Future<void> update(DailyFeeling updated, Set<String> changedFields) async {
+  // 1. Обновляем локально
+  await db.update(db.dailyFeelings).replace(updated);
+  
+  // 2. В outbox с метаданными для merge
+  await db.enqueue(UpsertOp(
+    opId: uuid.v4(),
+    kind: 'daily_feeling',
+    id: updated.id,
+    localTimestamp: DateTime.now().toUtc(),
+    payloadJson: updated.toJson(),
+    baseUpdatedAt: updated.updatedAt,  // когда получили с сервера
+    changedFields: changedFields,       // что изменил пользователь
+  ));
+}
+
+// Пример использования
+await update(
+  feeling.copyWith(mood: 5),
+  {'mood'},  // изменили только mood
+);
+```
+
+### Удаление
+
+```dart
+Future<void> delete(String id, DateTime? serverUpdatedAt) async {
+  // 1. Удаляем локально
+  await (db.delete(db.dailyFeelings)..where((t) => t.id.equals(id))).go();
+  
+  // 2. В outbox
+  await db.enqueue(DeleteOp(
+    opId: uuid.v4(),
+  kind: 'daily_feeling',
+    id: id,
+  localTimestamp: DateTime.now().toUtc(),
+    baseUpdatedAt: serverUpdatedAt,
+  ));
+}
+```
+
+### Синхронизация
+
+```dart
+// Вручную
+final stats = await engine.sync();
+
+// Автоматически каждые 5 минут
+engine.startAuto(interval: Duration(minutes: 5));
+engine.stopAuto();
+
+// Для конкретных таблиц
+await engine.sync(kinds: {'daily_feeling', 'health_record'});
+```
+
+---
+
+## Разрешение конфликтов
+
+Конфликт возникает когда данные изменились и на клиенте, и на сервере.
 
 ### Стратегии
 
-- **autoPreserve** (по умолчанию) — умный merge: сохраняет все данные, объединяет списки, не теряет ни локальные ни серверные изменения
-- **serverWins** — серверная версия всегда побеждает
-- **clientWins** — клиентская версия всегда побеждает (forcePush)
-- **lastWriteWins** — побеждает версия с более поздним timestamp
-- **merge** — автоматическое слияние данных через кастомную функцию
-- **manual** — ручное разрешение через callback
+| Стратегия | Описание |
+|-----------|----------|
+| `autoPreserve` | **(по умолчанию)** Умный merge — сохраняет все данные |
+| `serverWins` | Серверная версия побеждает |
+| `clientWins` | Клиентская версия побеждает (force push) |
+| `lastWriteWins` | Побеждает более поздний timestamp |
+| `merge` | Кастомная функция слияния |
+| `manual` | Ручное разрешение через callback |
 
-### autoPreserve — как это работает
+### autoPreserve
 
-При конфликте `autoPreserve`:
+Стратегия по умолчанию — объединяет данные без потерь:
 
+```dart
+// Локально: {mood: 5, notes: "My notes"}
+// На сервере: {mood: 3, energy: 7}
+// Результат:  {mood: 5, energy: 7, notes: "My notes"}
+```
+
+Как работает:
 1. Берёт серверные данные как базу
-2. Применяет локальные изменения поверх (только изменённые поля если указаны `changedFields`)
-3. Для списков — объединяет (union) без дубликатов
-4. Для вложенных объектов — рекурсивно мержит
-5. Системные поля (`id`, `updatedAt`, `createdAt`) всегда берёт с сервера
-6. Отправляет объединённые данные на сервер с force-update
-
-```dart
-// Пример
-// Локальные данные: {mood: 5, notes: "My notes"}
-// Серверные данные: {mood: 3, energy: 7}
-// Результат merge:  {mood: 5, energy: 7, notes: "My notes"}
-```
-
-### Отслеживание изменённых полей
-
-Для точного merge можно указать какие поля изменил пользователь:
-
-```dart
-await db.enqueue(UpsertOp(
-  opId: uuid(),
-  kind: 'daily_feeling',
-  id: 'feeling-123',
-  localTimestamp: DateTime.now().toUtc(),
-  payloadJson: {'id': 'feeling-123', 'mood': 5, 'energy': 7},
-  baseUpdatedAt: lastSyncTime,     // когда данные были получены с сервера
-  changedFields: {'mood'},         // пользователь изменил только mood
-));
-```
-
-Если `changedFields` указан — при merge применяются только эти поля из локальных данных.
-
-### Настройка
-
-```dart
-final engine = SyncEngine(
-  db: db,
-  transport: transport,
-  tables: [...],
-  config: SyncConfig(
-    conflictStrategy: ConflictStrategy.autoPreserve, // по умолчанию
-    maxConflictRetries: 3,
-    conflictRetryDelay: Duration(milliseconds: 500),
-    skipConflictingOps: false,
-  ),
-);
-```
+2. Применяет локальные изменения (только `changedFields` если указаны)
+3. Списки объединяет без дубликатов
+4. Вложенные объекты мержит рекурсивно
+5. Системные поля (`id`, `updatedAt`, `createdAt`) берёт с сервера
+6. Отправляет результат с `X-Force-Update: true`
 
 ### Ручное разрешение
 
 ```dart
 final engine = SyncEngine(
-  db: db,
-  transport: transport,
-  tables: [...],
+  // ...
   config: SyncConfig(
     conflictStrategy: ConflictStrategy.manual,
     conflictResolver: (conflict) async {
-      // conflict содержит:
-      // - kind, entityId, opId
-      // - localData, serverData
-      // - localTimestamp, serverTimestamp
-      // - serverVersion
-      // - changedFields (если были указаны)
+      // Показать диалог пользователю или решить программно
       
-      // Варианты разрешения:
-      return AcceptServer();      // принять серверную версию
-      return AcceptClient();      // принять клиентскую версию  
-      return AcceptMerged({...}); // использовать объединённые данные
-      return DeferResolution();   // отложить (оставить в outbox)
-      return DiscardOperation();  // отменить операцию
+      return AcceptServer();       // взять серверную версию
+      return AcceptClient();       // взять клиентскую версию
+      return AcceptMerged({...});  // свой результат merge
+      return DeferResolution();    // отложить (оставить в outbox)
+      return DiscardOperation();   // отменить операцию
     },
   ),
 );
 ```
 
-### Кастомное слияние данных
+### Кастомный merge
 
 ```dart
 final engine = SyncEngine(
-  db: db,
-  transport: transport,
-  tables: [...],
+  // ...
   config: SyncConfig(
     conflictStrategy: ConflictStrategy.merge,
     mergeFunction: (local, server) {
-      // Кастомная логика слияния
       return {...server, ...local};
     },
   ),
 );
 
-// Встроенные утилиты:
-ConflictUtils.defaultMerge(local, server);    // server + локальные изменения
-ConflictUtils.deepMerge(local, server);       // глубокое слияние для вложенных объектов
-ConflictUtils.preservingMerge(local, server); // умный merge с информацией об источниках
+// Встроенные утилиты
+ConflictUtils.defaultMerge(local, server);
+ConflictUtils.deepMerge(local, server);
+ConflictUtils.preservingMerge(local, server, changedFields: {'mood'});
 ```
 
-### Настройка для отдельных таблиц
+### Стратегия для отдельных таблиц
 
 ```dart
 final engine = SyncEngine(
-  db: db,
-  transport: transport,
-  tables: [...],
-  config: const SyncConfig(
-    conflictStrategy: ConflictStrategy.autoPreserve, // глобальная стратегия
-  ),
+  // ...
   tableConflictConfigs: {
-    'important_data': const TableConflictConfig(
-      strategy: ConflictStrategy.clientWins, // для этой таблицы
-    ),
     'user_settings': TableConflictConfig(
-      strategy: ConflictStrategy.merge,
-      mergeFunction: customMergeSettings,
+      strategy: ConflictStrategy.clientWins,
     ),
   },
 );
 ```
 
-### События конфликтов
+---
+
+## События и статистика
 
 ```dart
+// Подписка на события
 engine.events.listen((event) {
-  if (event is ConflictDetectedEvent) {
-    print('Конфликт: ${event.conflict.kind}/${event.conflict.entityId}');
-    print('Стратегия: ${event.strategy}');
-  }
-  
-  if (event is DataMergedEvent) {
-    print('Данные объединены: ${event.kind}/${event.entityId}');
-    print('Локальные поля: ${event.localFields}');
-    print('Серверные поля: ${event.serverFields}');
-  }
-  
-  if (event is ConflictResolvedEvent) {
-    print('Разрешён: ${event.resolution.runtimeType}');
-    print('Результат: ${event.resultData}');
-  }
-  
-  if (event is ConflictUnresolvedEvent) {
-    print('Не разрешён: ${event.reason}');
+  switch (event) {
+    case SyncStarted(:final phase):
+      print('Начало: $phase');
+    case SyncProgress(:final done, :final total):
+      print('Прогресс: $done/$total');
+    case SyncCompleted(:final stats):
+      print('Готово: pushed=${stats.pushed}, pulled=${stats.pulled}');
+    case ConflictDetectedEvent(:final conflict):
+      print('Конфликт: ${conflict.entityId}');
+    case SyncErrorEvent(:final error):
+      print('Ошибка: $error');
   }
 });
-```
 
-### Статистика синхронизации
-
-```dart
+// Статистика после sync
 final stats = await engine.sync();
 print('Отправлено: ${stats.pushed}');
 print('Получено: ${stats.pulled}');
@@ -241,25 +359,55 @@ print('Разрешено: ${stats.conflictsResolved}');
 print('Ошибок: ${stats.errors}');
 ```
 
-## Минимум от бэка
+---
 
-В каждой сущности должно быть поле updatedAt в UTC. deletedAt если поддерживаете удаления.
+## Требования к серверу
 
-### Эндпоинты
+Для полноценной работы offline-first синхронизации сервер должен реализовать определённый контракт.
 
-```
-GET  /{kind}?updatedSince=...&limit=...&afterId=...&includeDeleted=true
-POST /{kind}
-PUT  /{kind}/{id}
-DELETE /{kind}/{id}
-```
+### Обязательные эндпоинты
 
-### Формат запроса с детекцией конфликтов
+| Метод | URL | Описание |
+|-------|-----|----------|
+| `GET` | `/{kind}` | Получить список с фильтрацией |
+| `POST` | `/{kind}` | Создать запись |
+| `PUT` | `/{kind}/{id}` | Обновить запись |
+| `DELETE` | `/{kind}/{id}` | Удалить запись |
 
-Клиент отправляет `_baseUpdatedAt` — timestamp когда данные были получены с сервера:
+`{kind}` — тип сущности (например `daily_feeling`, `health_record`).
+
+### Обязательные поля в моделях
+
+Каждая синхронизируемая сущность должна иметь:
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `id` | `string` | Уникальный идентификатор (UUID) |
+| `updatedAt` | `datetime` | Время последнего изменения в UTC |
+| `deletedAt` | `datetime?` | Время удаления (для soft-delete) |
+
+**Важно:** `updatedAt` должен устанавливаться **сервером** при каждом изменении!
 
 ```json
+{
+  "id": "abc-123",
+  "mood": 5,
+  "energy": 7,
+  "updatedAt": "2025-01-15T10:30:00Z",
+  "deletedAt": null
+}
+```
+
+### Детекция конфликтов
+
+Клиент отправляет `_baseUpdatedAt` — timestamp когда данные были получены с сервера.
+
+**Запрос клиента:**
+```http
 PUT /daily_feeling/abc-123
+Content-Type: application/json
+X-Idempotency-Key: op-uuid-456
+
 {
   "id": "abc-123",
   "mood": 5,
@@ -268,137 +416,343 @@ PUT /daily_feeling/abc-123
 }
 ```
 
-### Логика сервера (PUT)
+**Логика сервера:**
 
 ```python
-@app.put("/{kind}/{id}")
 def update(kind: str, id: str, data: dict):
     existing = db.get(kind, id)
-    
     if not existing:
-        return Response(404, {"error": "not_found"})
+        return 404, {"error": "not_found"}
     
-    # Проверка конфликта по _baseUpdatedAt
+    # Извлекаем _baseUpdatedAt из payload
     base_updated = data.pop('_baseUpdatedAt', None)
+    
+    # Проверяем конфликт
     if base_updated:
         base_dt = parse_datetime(base_updated)
         if existing.updated_at > base_dt:
-            # Конфликт! Клиент работал с устаревшими данными
-            return Response(409, {
+            # Конфликт! Данные изменились после того как клиент их получил
+            return 409, {
                 "error": "conflict",
                 "current": existing.to_dict()
-            })
+            }
     
     # Нет конфликта — обновляем
     existing.update(data)
-    existing.updated_at = utcnow()  # Серверное время!
+    existing.updated_at = datetime.utcnow()  # сервер ставит время!
     db.save(existing)
     
-    return Response(200, existing.to_dict())
+    return 200, existing.to_dict()
 ```
 
-### Формат ответа 409 Conflict
-
+**Ответ при конфликте (409):**
 ```json
 {
   "error": "conflict",
   "current": {
     "id": "abc-123",
     "mood": 4,
-    "energy": 7,
-    "notes": null,
+    "energy": 8,
     "updatedAt": "2025-01-15T11:30:00Z"
   }
 }
 ```
 
-### Force-update (после merge)
+### Идемпотентность
 
-После merge клиент отправляет объединённые данные с заголовком `X-Force-Update: true`:
+Клиент отправляет заголовок `X-Idempotency-Key` с UUID операции.
 
+**Сервер должен:**
+1. Сохранять ключи выполненных операций (минимум 24 часа)
+2. При повторном запросе с тем же ключом — возвращать тот же результат
+3. Не выполнять операцию повторно
+
+```python
+def handle_request(idempotency_key: str, handler):
+    # Проверяем кэш
+    cached = cache.get(f"idempotency:{idempotency_key}")
+    if cached:
+        return cached
+    
+    # Выполняем операцию
+    result = handler()
+    
+    # Сохраняем результат
+    cache.set(f"idempotency:{idempotency_key}", result, ttl=86400)
+    return result
 ```
+
+### Force-update
+
+После merge клиент отправляет заголовок `X-Force-Update: true`.
+
+**Сервер должен:**
+- Принять данные **без проверки** `_baseUpdatedAt`
+- Это позволяет клиенту записать объединённые данные
+
+```http
 PUT /daily_feeling/abc-123
+Content-Type: application/json
 X-Force-Update: true
-X-Idempotency-Key: op-uuid-123
+X-Idempotency-Key: op-uuid-789
 
 {
   "id": "abc-123",
   "mood": 5,
-  "energy": 7
+  "energy": 8,
+  "notes": "Merged data"
 }
 ```
 
-Сервер должен принять данные без проверки `_baseUpdatedAt`.
-
-### Идемпотентность
-
-Сервер должен проверять заголовок `X-Idempotency-Key`:
-- Если операция с таким ключом уже выполнена — вернуть тот же результат
-- Хранить ключи 24 часа
-
-### Загрузка данных (GET)
-
+```python
+def update(kind: str, id: str, data: dict, headers: dict):
+    force_update = headers.get('X-Force-Update') == 'true'
+    
+    if not force_update:
+        # Обычная проверка конфликта
+        base_updated = data.pop('_baseUpdatedAt', None)
+        if base_updated and existing.updated_at > parse_datetime(base_updated):
+            return 409, {"error": "conflict", "current": existing.to_dict()}
+    
+    # Force-update или нет конфликта — обновляем
+    existing.update(data)
+    existing.updated_at = datetime.utcnow()
+    db.save(existing)
+    return 200, existing.to_dict()
 ```
-GET /health_record?updatedSince=2025-09-01T00:00:00Z&limit=500&includeDeleted=true&afterId=xyz
+
+### Пагинация
+
+**GET запрос с параметрами:**
+```http
+GET /daily_feeling?updatedSince=2025-01-01T00:00:00Z&limit=500&afterId=xyz&includeDeleted=true
 ```
 
-Сервер должен возвращать:
+| Параметр | Описание |
+|----------|----------|
+| `updatedSince` | Получить записи изменённые после этого времени |
+| `limit` | Максимум записей (рекомендуется 500) |
+| `afterId` | ID последней полученной записи (для стабильной пагинации) |
+| `includeDeleted` | Включить удалённые записи (soft-delete) |
+
+**Ответ:**
 ```json
 {
-  "items": [...],
-  "nextPageToken": "следующая_страница"
+  "items": [
+    {"id": "abc-123", "mood": 5, "updatedAt": "2025-01-15T10:00:00Z"},
+    {"id": "def-456", "mood": 3, "updatedAt": "2025-01-15T10:05:00Z"}
+  ],
+  "nextPageToken": "eyJ0cyI6IjIwMjUtMDEtMTVUMTA6MDU6MDBaIiwiaWQiOiJkZWYtNDU2In0="
 }
 ```
 
-Сортировка: `ORDER BY updatedAt ASC, id ASC`.
+**Важно — стабильная пагинация:**
 
-## Идеальный бэк
-
-- POST /{kind}/bulk для массовой отправки
-- ETag или Last-Modified для кэширования
-- Поток томбстоунов для удалений
-- Retry-After для rate limiting
-- GET /health для проверки
-- Gzip сжатие
-- 409 Conflict с текущими данными при конфликте версий
-- Идемпотентность через X-Idempotency-Key
-- Force-update через X-Force-Update заголовок
-
-## Стабильная пагинация
-
-Чтобы не терять данные при загрузке, сервер должен фильтровать так:
+Чтобы не терять и не дублировать записи при пагинации:
 
 ```sql
-WHERE (updatedAt > :ts) OR (updatedAt = :ts AND id > :id)
-ORDER BY updatedAt ASC, id ASC
+-- Используем составной курсор (updatedAt + id)
+SELECT * FROM daily_feeling
+WHERE 
+  (updated_at > :updatedSince) 
+  OR (updated_at = :updatedSince AND id > :afterId)
+ORDER BY updated_at ASC, id ASC
 LIMIT :limit
 ```
 
-## Логи и события
+### Примеры реализации
 
-SyncEngine.events дает события: старт синка, прогресс, завершение, ошибки, конфликты, merge, обновления кэша.
+<details>
+<summary><b>Python (FastAPI)</b></summary>
 
-## Flow синхронизации
+```python
+from fastapi import FastAPI, Header, HTTPException
+from datetime import datetime
+from typing import Optional
 
+app = FastAPI()
+
+@app.get("/{kind}")
+async def list_items(
+    kind: str,
+    updatedSince: Optional[datetime] = None,
+    limit: int = 500,
+    afterId: Optional[str] = None,
+    includeDeleted: bool = True,
+):
+    query = db.query(get_model(kind))
+    
+    if updatedSince:
+        if afterId:
+            query = query.filter(
+                or_(
+                    Model.updated_at > updatedSince,
+                    and_(Model.updated_at == updatedSince, Model.id > afterId)
+                )
+            )
+        else:
+            query = query.filter(Model.updated_at >= updatedSince)
+    
+    if not includeDeleted:
+        query = query.filter(Model.deleted_at.is_(None))
+    
+    items = query.order_by(Model.updated_at, Model.id).limit(limit).all()
+    
+    next_token = None
+    if len(items) == limit:
+        last = items[-1]
+        next_token = encode_cursor(last.updated_at, last.id)
+    
+    return {"items": [i.to_dict() for i in items], "nextPageToken": next_token}
+
+
+@app.put("/{kind}/{id}")
+async def update_item(
+    kind: str,
+    id: str,
+    data: dict,
+    x_force_update: Optional[str] = Header(None),
+    x_idempotency_key: Optional[str] = Header(None),
+):
+    # Идемпотентность
+    if x_idempotency_key:
+        cached = cache.get(f"idempotency:{x_idempotency_key}")
+        if cached:
+            return cached
+    
+    existing = db.get(get_model(kind), id)
+    if not existing:
+        raise HTTPException(404, {"error": "not_found"})
+    
+    # Проверка конфликта (если не force-update)
+    if x_force_update != "true":
+        base_updated = data.pop("_baseUpdatedAt", None)
+        if base_updated:
+            base_dt = datetime.fromisoformat(base_updated.replace("Z", "+00:00"))
+            if existing.updated_at > base_dt:
+                return JSONResponse(409, {
+                    "error": "conflict",
+                    "current": existing.to_dict()
+                })
+    else:
+        data.pop("_baseUpdatedAt", None)
+    
+    # Обновляем
+    for key, value in data.items():
+        if key not in ("id", "updatedAt", "createdAt"):
+            setattr(existing, key, value)
+    existing.updated_at = datetime.utcnow()
+    db.commit()
+    
+    result = existing.to_dict()
+    
+    # Сохраняем для идемпотентности
+    if x_idempotency_key:
+        cache.set(f"idempotency:{x_idempotency_key}", result, ttl=86400)
+    
+    return result
 ```
-1. Пользователь редактирует запись
-   → Сохраняем: payload, baseUpdatedAt (когда получили), changedFields
+</details>
 
-2. sync() → push
-   → Отправляем payload + _baseUpdatedAt
-   
-3. Сервер проверяет
-   → if (db.updated_at > _baseUpdatedAt) return 409 + current data
-   → else update + return 200
+<details>
+<summary><b>Node.js (Express)</b></summary>
 
-4. Клиент получает 409
-   → preservingMerge(localData, serverData, changedFields)
-   → Повторный push с merged данными (X-Force-Update: true)
+```javascript
+app.get('/:kind', async (req, res) => {
+  const { kind } = req.params;
+  const { updatedSince, limit = 500, afterId, includeDeleted = 'true' } = req.query;
+  
+  let query = db(kind);
+  
+  if (updatedSince) {
+    if (afterId) {
+      query = query.where(function() {
+        this.where('updated_at', '>', updatedSince)
+          .orWhere(function() {
+            this.where('updated_at', '=', updatedSince).andWhere('id', '>', afterId);
+          });
+      });
+    } else {
+      query = query.where('updated_at', '>=', updatedSince);
+    }
+  }
+  
+  if (includeDeleted !== 'true') {
+    query = query.whereNull('deleted_at');
+  }
+  
+  const items = await query.orderBy('updated_at').orderBy('id').limit(limit);
+  
+  let nextPageToken = null;
+  if (items.length === limit) {
+    const last = items[items.length - 1];
+    nextPageToken = Buffer.from(JSON.stringify({
+      ts: last.updated_at,
+      id: last.id
+    })).toString('base64');
+  }
+  
+  res.json({ items, nextPageToken });
+});
 
-5. Сервер принимает
-   → Обновляет запись
-   → Возвращает 200
-
-6. Клиент сохраняет результат локально
-   → Удаляет из outbox
+app.put('/:kind/:id', async (req, res) => {
+  const { kind, id } = req.params;
+  const forceUpdate = req.headers['x-force-update'] === 'true';
+  const idempotencyKey = req.headers['x-idempotency-key'];
+  
+  // Идемпотентность
+  if (idempotencyKey) {
+    const cached = await cache.get(`idempotency:${idempotencyKey}`);
+    if (cached) return res.json(cached);
+  }
+  
+  const existing = await db(kind).where({ id }).first();
+  if (!existing) {
+    return res.status(404).json({ error: 'not_found' });
+  }
+  
+  const data = { ...req.body };
+  const baseUpdatedAt = data._baseUpdatedAt;
+  delete data._baseUpdatedAt;
+  
+  // Проверка конфликта
+  if (!forceUpdate && baseUpdatedAt) {
+    if (new Date(existing.updated_at) > new Date(baseUpdatedAt)) {
+      return res.status(409).json({
+        error: 'conflict',
+        current: existing
+      });
+    }
+  }
+  
+  // Обновляем
+  delete data.id;
+  delete data.updatedAt;
+  delete data.createdAt;
+  data.updated_at = new Date().toISOString();
+  
+  await db(kind).where({ id }).update(data);
+  const result = await db(kind).where({ id }).first();
+  
+  // Сохраняем для идемпотентности
+  if (idempotencyKey) {
+    await cache.set(`idempotency:${idempotencyKey}`, result, 86400);
+  }
+  
+  res.json(result);
+});
 ```
+</details>
+
+### Чеклист для сервера
+
+- [ ] Поле `updatedAt` в каждой модели, устанавливается сервером
+- [ ] Поле `deletedAt` для soft-delete (опционально)
+- [ ] GET с параметрами `updatedSince`, `limit`, `afterId`, `includeDeleted`
+- [ ] Стабильная пагинация: `ORDER BY updatedAt, id`
+- [ ] Формат ответа: `{"items": [...], "nextPageToken": "..."}`
+- [ ] Проверка `_baseUpdatedAt` при PUT для детекции конфликтов
+- [ ] Ответ 409 с `{"error": "conflict", "current": {...}}`
+- [ ] Поддержка заголовка `X-Force-Update: true`
+- [ ] Поддержка заголовка `X-Idempotency-Key` с кэшированием 24ч
+- [ ] Возврат обновлённой записи в ответе PUT/POST
