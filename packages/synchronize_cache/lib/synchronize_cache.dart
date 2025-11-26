@@ -1,10 +1,11 @@
-/// Offline-first cache with sync capabilities built on Drift.
-library synchronize_cache;
+// Offline-first cache with sync capabilities built on Drift.
 
-// Tables
+// Tables (use include: {'package:synchronize_cache/src/sync_tables.drift'})
 export 'src/tables/sync_columns.dart';
-export 'src/tables/outbox.dart';
-export 'src/tables/cursors.dart';
+export 'src/tables/outbox.dart' show SyncOutbox;
+export 'src/tables/outbox.drift.dart' show SyncOutboxData, SyncOutboxCompanion;
+export 'src/tables/cursors.dart' show SyncCursors;
+export 'src/tables/cursors.drift.dart' show SyncCursor, SyncCursorsCompanion;
 
 // Types
 export 'src/constants.dart';
@@ -27,4 +28,3 @@ export 'src/services/pull_service.dart';
 // Core
 export 'src/sync_database.dart';
 export 'src/sync_engine.dart';
-

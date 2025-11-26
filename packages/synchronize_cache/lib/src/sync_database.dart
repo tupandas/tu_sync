@@ -4,46 +4,42 @@ import 'package:drift/drift.dart';
 import 'package:synchronize_cache/src/constants.dart';
 import 'package:synchronize_cache/src/cursor.dart';
 import 'package:synchronize_cache/src/op.dart';
-import 'package:synchronize_cache/src/tables/cursors.dart';
-import 'package:synchronize_cache/src/tables/outbox.dart';
+import 'package:synchronize_cache/src/tables/cursors.drift.dart';
+import 'package:synchronize_cache/src/tables/outbox.drift.dart';
 
 /// Mixin для базы данных с поддержкой синхронизации.
 ///
 /// Для использования:
-/// 1. Добавьте SyncOutbox и SyncCursors в @DriftDatabase(tables: [...])
+/// 1. Добавьте в @DriftDatabase:
+///    `include: {'package:synchronize_cache/src/sync_tables.drift'}`
 /// 2. Добавьте "with SyncDatabaseMixin" к вашему классу базы данных
 ///
-/// Drift автоматически генерирует геттеры syncOutbox и syncCursors.
+/// Drift автоматически подключит sync_outbox и sync_cursors таблицы.
 mixin SyncDatabaseMixin on GeneratedDatabase {
-  // Кэшированные ссылки на таблицы
   TableInfo<Table, SyncOutboxData>? _outboxTable;
-  TableInfo<Table, SyncCursorsData>? _cursorsTable;
+  TableInfo<Table, SyncCursor>? _cursorsTable;
 
   /// Получить таблицу outbox.
-  TableInfo<Table, SyncOutboxData> get _outbox {
-    return _outboxTable ??= allTables
-            .whereType<TableInfo<Table, SyncOutboxData>>()
-            .firstWhere(
-              (t) => t.actualTableName == 'sync_outbox',
-              orElse: () => throw StateError(
-                'SyncOutbox table not found. Make sure to add SyncOutbox '
-                'to your @DriftDatabase(tables: [...]) annotation.',
-              ),
-            );
-  }
+  TableInfo<Table, SyncOutboxData> get _outbox =>
+      _outboxTable ??= allTables.whereType<TableInfo<Table, SyncOutboxData>>().firstWhere(
+            (t) => t.actualTableName == 'sync_outbox',
+            orElse: () => throw StateError(
+              'SyncOutbox table not found. Make sure to add:\n'
+              "include: {'package:synchronize_cache/src/sync_tables.drift'}\n"
+              'to your @DriftDatabase annotation.',
+            ),
+          );
 
   /// Получить таблицу cursors.
-  TableInfo<Table, SyncCursorsData> get _cursors {
-    return _cursorsTable ??= allTables
-            .whereType<TableInfo<Table, SyncCursorsData>>()
-            .firstWhere(
-              (t) => t.actualTableName == 'sync_cursors',
-              orElse: () => throw StateError(
-                'SyncCursors table not found. Make sure to add SyncCursors '
-                'to your @DriftDatabase(tables: [...]) annotation.',
-              ),
-            );
-  }
+  TableInfo<Table, SyncCursor> get _cursors =>
+      _cursorsTable ??= allTables.whereType<TableInfo<Table, SyncCursor>>().firstWhere(
+            (t) => t.actualTableName == 'sync_cursors',
+            orElse: () => throw StateError(
+              'SyncCursors table not found. Make sure to add:\n'
+              "include: {'package:synchronize_cache/src/sync_tables.drift'}\n"
+              'to your @DriftDatabase annotation.',
+            ),
+          );
 
   /// Добавить операцию в очередь отправки.
   Future<void> enqueue(Op op) async {
@@ -189,5 +185,24 @@ mixin SyncDatabaseMixin on GeneratedDatabase {
       variables: [Variable.withInt(th)],
       updateKind: UpdateKind.delete,
     );
+  }
+
+  /// Сбросить все курсоры для указанных типов.
+  Future<void> resetAllCursors(Set<String> kinds) async {
+    if (kinds.isEmpty) return;
+
+    final placeholders = List.filled(kinds.length, '?').join(', ');
+    await customStatement(
+      'DELETE FROM ${TableNames.syncCursors} WHERE ${TableColumns.kind} IN ($placeholders)',
+      kinds.toList(),
+    );
+  }
+
+  /// Очистить данные синхронизируемых таблиц.
+  /// [tableNames] — имена таблиц для очистки.
+  Future<void> clearSyncableTables(List<String> tableNames) async {
+    for (final tableName in tableNames) {
+      await customStatement('DELETE FROM "$tableName"');
+    }
   }
 }
