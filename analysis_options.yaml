@@ -9,6 +9,7 @@ analyzer:
     - build/**
     - ".dart_tool/**"
     - "**/*.g.dart"
+    - "**/example/**"
 
 linter:
   rules:
