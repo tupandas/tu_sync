@@ -45,10 +45,12 @@ dependencies:
   offline_first_sync_drift_rest:
     path: packages/offline_first_sync_drift_rest
   drift: ^2.0.0
+  json_annotation: ^4.8.0
 
 dev_dependencies:
   drift_dev: ^2.0.0
   build_runner: ^2.0.0
+  json_serializable: ^6.7.0
 ```
 
 **build.yaml** (требуется modular generation для межпакетного шаринга):
@@ -78,25 +80,14 @@ targets:
 import 'package:drift/drift.dart';
 import 'package:offline_first_sync_drift/offline_first_sync_drift.dart';
 
-part 'database.g.dart';
-
-@UseRowClass(DailyFeeling, generateInsertable: true)
-class DailyFeelings extends Table with SyncColumns {
-  TextColumn get id => text()();
-  IntColumn get mood => integer().nullable()();
-  IntColumn get energy => integer().nullable()();
-  TextColumn get notes => text().nullable()();
-  DateTimeColumn get date => dateTime()();
-
-  @override
-  Set<Column> get primaryKey => {id};
-}
+import 'database.drift.dart';
+import 'models/daily_feeling.dart'; // см. секцию "Модель данных"
 
 @DriftDatabase(
   include: {'package:offline_first_sync_drift/src/sync_tables.drift'},
   tables: [DailyFeelings],
 )
-class AppDatabase extends _$AppDatabase with SyncDatabaseMixin {
+class AppDatabase extends $AppDatabase with SyncDatabaseMixin {
   AppDatabase(super.e);
 
   @override
@@ -143,6 +134,44 @@ final engine = SyncEngine(
 Добавьте `SyncColumns`, и все обязательные системные поля появятся автоматически - вам останется описать только доменные колонки. Таблица при этом автоматически реализует `SynchronizableTable`, так что можно типобезопасно отличать её от обычных Drift таблиц:
 
 ```dart
+import 'package:drift/drift.dart';
+import 'package:json_annotation/json_annotation.dart';
+import 'package:offline_first_sync_drift/offline_first_sync_drift.dart';
+
+part 'daily_feeling.g.dart';
+
+/// Модель данных (row class).
+@JsonSerializable(fieldRename: FieldRename.snake)
+class DailyFeeling {
+  DailyFeeling({
+    required this.id,
+    required this.updatedAt,
+    this.deletedAt,
+    this.deletedAtLocal,
+    required this.date,
+    this.mood,
+    this.energy,
+    this.notes,
+  });
+
+  final String id;
+  final DateTime updatedAt;
+  final DateTime? deletedAt;
+  final DateTime? deletedAtLocal;
+  final DateTime date;
+  final int? mood;
+  final int? energy;
+  final String? notes;
+
+  factory DailyFeeling.fromJson(Map<String, dynamic> json) =>
+      _$DailyFeelingFromJson(json);
+
+  Map<String, dynamic> toJson() => _$DailyFeelingToJson(this);
+
+  // toInsertable() генерируется автоматически благодаря generateInsertable: true
+}
+
+/// Drift-таблица со всеми sync-полями.
 @UseRowClass(DailyFeeling, generateInsertable: true)
 class DailyFeelings extends Table with SyncColumns {
   TextColumn get id => text()();
@@ -150,7 +179,7 @@ class DailyFeelings extends Table with SyncColumns {
   IntColumn get energy => integer().nullable()();
   TextColumn get notes => text().nullable()();
   DateTimeColumn get date => dateTime()();
-  
+
   @override
   Set<Column> get primaryKey => {id};
 }
@@ -186,11 +215,11 @@ db.select(db.dailyFeelings).watch().listen((list) {
 Future<void> create(DailyFeeling feeling) async {
   await db.into(db.dailyFeelings).insert(feeling);
   
-await db.enqueue(UpsertOp(
-  opId: uuid.v4(),
+  await db.enqueue(UpsertOp(
+    opId: uuid.v4(),
     kind: 'daily_feeling',
     id: feeling.id,
-  localTimestamp: DateTime.now().toUtc(),
+    localTimestamp: DateTime.now().toUtc(),
     payloadJson: feeling.toJson(),
   ));
 }
@@ -214,9 +243,9 @@ Future<void> deleteFeeling(String id, DateTime? serverUpdatedAt) async {
   
   await db.enqueue(DeleteOp(
     opId: uuid.v4(),
-  kind: 'daily_feeling',
+    kind: 'daily_feeling',
     id: id,
-  localTimestamp: DateTime.now().toUtc(),
+    localTimestamp: DateTime.now().toUtc(),
     baseUpdatedAt: serverUpdatedAt,
   ));
 }
@@ -282,12 +311,15 @@ final engine = SyncEngine(
     conflictStrategy: ConflictStrategy.manual,
     conflictResolver: (conflict) async {
       // Показать диалог пользователю или решить программно
+      final choice = await showConflictDialog(conflict);
       
-      return AcceptServer();       // взять серверную версию
-      return AcceptClient();       // взять клиентскую версию
-      return AcceptMerged({...});  // свой результат merge
-      return DeferResolution();    // отложить (оставить в outbox)
-      return DiscardOperation();   // отменить операцию
+      return switch (choice) {
+        'server' => AcceptServer(),
+        'client' => AcceptClient(),
+        'merge'  => AcceptMerged({...}),
+        'defer'  => DeferResolution(),
+        _        => DiscardOperation(),
+      };
     },
   ),
 );
@@ -365,7 +397,7 @@ print('Ошибок: ${stats.errors}');
 
 Краткое напоминание:
 
-- реализуйте CRUD-эндпоинты `/ {kind }` с фильтрами `updatedSince`, `afterId`, `limit`, `includeDeleted`;
+- реализуйте CRUD-эндпоинты `/{kind}` с фильтрами `updatedSince`, `afterId`, `limit`, `includeDeleted`;
 - держите `updatedAt` и (опционально) `deletedAt`, выставляя системные поля на сервере;
 - при PUT проверяйте `_baseUpdatedAt`, возвращайте `409` с текущими данными и поддерживайте `X-Force-Update` + `X-Idempotency-Key`;
 - отдавайте списки в формате `{ "items": [...], "nextPageToken": "..." }`, строя курсор по `(updatedAt, id)`;
