@@ -29,18 +29,18 @@ jobs:
         run: dart run build_runner build --delete-conflicting-outputs
         working-directory: example
 
-      - name: Generate code (synchronize_cache_rest)
+      - name: Generate code (offline_first_sync_drift_rest)
         run: dart run build_runner build --delete-conflicting-outputs
-        working-directory: packages/synchronize_cache_rest
+        working-directory: packages/offline_first_sync_drift_rest
 
       - name: Lint (dart analyze)
         run: dart analyze .
 
-      - name: Test synchronize_cache
-        run: flutter test packages/synchronize_cache
+      - name: Test offline_first_sync_drift
+        run: flutter test packages/offline_first_sync_drift
 
-      - name: Test synchronize_cache_rest
-        run: flutter test packages/synchronize_cache_rest
+      - name: Test offline_first_sync_drift_rest
+        run: flutter test packages/offline_first_sync_drift_rest
 
       - name: Test example app
         run: flutter test
